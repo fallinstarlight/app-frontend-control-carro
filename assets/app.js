@@ -75,7 +75,7 @@ function refreshButtons() {
 }
 
 function displayStatus(status) {
-  $("#last-command").textContent = status.commandName ?? "No command";
+  $("#last-command").textContent = (status.commandName ?? "No command").replace(/_/g, " ");
   $$("[data-code]").forEach((button) => button.classList.toggle("active", Number(button.dataset.code) === status.code));
 }
 

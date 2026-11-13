@@ -26,18 +26,18 @@ body {
 }
 .readout,.switches,.program {display:flex;justify-content:center;align-items:center;gap:10px}
 .readout {justify-content:space-between;font-size:clamp(12px,2.2vh,18px)}
-#last-command {font: bold 12px monospace;background:#313a2a;color:#daf5b8;padding:4px 9px;border-radius:3px}
+#last-command {font: bold clamp(18px,2.4vw,22px) monospace;background:#313a2a;color:#daf5b8;padding:4px 9px;border-radius:3px}
 .sticks {min-height:0;display:grid;grid-template-rows:repeat(2,minmax(0,1fr));gap:5px}
 .station {min-height:0;min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);justify-items:center;container-type:size}
-.station h2 {font-size:12px;line-height:17px;text-transform:uppercase;letter-spacing:2px}
+.station h2 {font-size:18px;line-height:22px;text-transform:uppercase;letter-spacing:2px}
 .stick {
-  width:min(100cqw,calc(100cqh - 19px),330px);aspect-ratio:1;align-self:center;position:relative;
+  width:min(100cqw,calc(100cqh - 24px),330px);aspect-ratio:1;align-self:center;position:relative;
   border:5px solid #594724;border-radius:50%; touch-action:none;user-select:none;cursor:grab;
   background:repeating-radial-gradient(circle,#303028 0 16%,#424138 17%,#282923 19%);
   box-shadow:0 2px 1px #fff09b,inset 0 5px 8px #15150e;
 }
 .stick:focus-visible {outline:3px solid white}
-.stick b {position:absolute;color:#f1d989;font: bold 11px monospace;pointer-events:none}
+.stick b {position:absolute;color:#f1d989;font: bold clamp(16px,6cqmin,22px) monospace;pointer-events:none}
 .north,.south {left:50%;transform:translateX(-50%)}.north{top:5%}.south{bottom:5%}
 .west,.east{top:50%;transform:translateY(-50%)}.west{left:5%}.east{right:5%}
 .knob {position:absolute;left:50%;top:50%;width:32%;height:32%;border-radius:50%;pointer-events:none;
@@ -48,6 +48,7 @@ body {
 .lever{background:linear-gradient(90deg,#393a30 44%,#171911 45% 55%,#393a30 56%)}
 .lever .knob{width:44%;height:20%;border-radius:7px;background:linear-gradient(#88897a,#595b4f 42%,#35372e)}
 .switches button,.program button {background:#282a23;color:#fff1bc;border:1px solid #50472d;border-radius:6px;padding:6px 12px;min-height:32px;font-weight:700}
+.switches button,.program button,.program select {font-size:18px}
 .switches [data-code="0"]{color:white;background:#7c3023}
 .switches {flex-wrap:wrap;gap:6px}
 #voice-command.listening {background:var(--white);color:var(--ink)}
