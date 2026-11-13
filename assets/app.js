@@ -2,11 +2,11 @@
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const DEFAULTS = { apiUrl: `http://${location.hostname || "localhost"}:8000`, vehicleId: 1 };
-let settings = { ...DEFAULTS };
+const API_BASE_URL = "https://indiscipline-haul-truck.duckdns.org";
+let vehicleId = 1;
 try {
   const saved = JSON.parse(localStorage.getItem("indiscipline.connection"));
-  if (saved) settings = validateSettings(saved.apiUrl, saved.vehicleId);
+  if (saved) vehicleId = validateVehicleId(saved.vehicleId);
 } catch { /* An invalid/stale preference must not prevent opening the page. */ }
 let commands = [];
 let connected = false;
@@ -18,14 +18,13 @@ let epoch = 0;
 let pollTimer;
 let schema;
 let endpoints = [];
+const voiceWords = ["STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "RISE", "LOWER", "LIGHTS", "SOUND"];
+let voiceSession = null;
 
-function validateSettings(address, id) {
-  const url = new URL(address);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
-    throw new Error("Use an HTTP or HTTPS API address without credentials, query or fragment.");
+function validateVehicleId(id) {
   const vehicleId = Number(id);
   if (!Number.isSafeInteger(vehicleId) || vehicleId < 1) throw new Error("Vehicle ID must be a positive integer.");
-  return { apiUrl: url.href.replace(/\/$/, ""), vehicleId };
+  return vehicleId;
 }
 
 function feedback(message, error = false, menu = false) {
@@ -34,18 +33,16 @@ function feedback(message, error = false, menu = false) {
   target.classList.toggle("error", error);
 }
 
-async function request(path, { method = "GET", body, connection = settings } = {}) {
+async function request(path, { method = "GET", body } = {}) {
   let response;
   try {
-    response = await fetch(`${connection.apiUrl}${path}`, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       method, headers: body === undefined ? {} : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(8000), cache: "no-store",
     });
   } catch (error) {
-    const hint = location.protocol === "https:" && connection.apiUrl.startsWith("http:")
-      ? " Open this page over HTTP to reach an HTTP API." : " Check the address, Wi-Fi and API server.";
-    throw new Error((method === "GET" ? "API unreachable." : "Request outcome unknown; it may have reached the API. Check status before retrying.") + hint);
+    throw new Error((method === "GET" ? "API unreachable." : "Request outcome unknown; it may have reached the API. Check status before retrying.") + " Check your connection and the API server.");
   }
   const text = await response.text();
   let data;
@@ -91,13 +88,13 @@ function formatTime(value) {
 async function pollStatus(currentEpoch = epoch) {
   clearTimeout(pollTimer);
   try {
-    const data = await request(`/status/${settings.vehicleId}`);
+    const data = await request(`/status/${vehicleId}`);
     if (currentEpoch !== epoch) return;
     displayStatus(data);
     setConnected(true);
     // Recover command discovery too if the server was down when the page opened.
     if (!commands.length) {
-      const loaded = await request(`/commands/vehicle/${settings.vehicleId}`);
+      const loaded = await request(`/commands/vehicle/${vehicleId}`);
       if (currentEpoch !== epoch) return;
       commands = loaded;
       refreshButtons();
@@ -118,14 +115,13 @@ async function connect() {
   commands = [];
   schema = undefined;
   setConnected(false);
-  $("#api-url").value = settings.apiUrl;
-  $("#vehicle-input").value = settings.vehicleId;
-  $("#vehicle-name").textContent = `Vehicle ${settings.vehicleId}`;
+  $("#vehicle-input").value = vehicleId;
+  $("#vehicle-name").textContent = `Vehicle ${vehicleId}`;
   displayStatus({});
   feedback("Loading vehicle commands…");
   try {
     const [vehicle, loadedCommands] = await Promise.all([
-      request(`/vehicles/${settings.vehicleId}`), request(`/commands/vehicle/${settings.vehicleId}`),
+      request(`/vehicles/${vehicleId}`), request(`/commands/vehicle/${vehicleId}`),
     ]);
     if (currentEpoch !== epoch) return;
     commands = loadedCommands;
@@ -138,6 +134,7 @@ async function connect() {
 }
 
 async function sendCommand(code) {
+  cancelVoice();
   if (sending) {
     if (code !== 0 && !stopQueued) nextDirection = code;
     if (code === 0) { nextDirection = null; stopQueued = true; refreshButtons(); feedback("STOP queued immediately after the pending request."); }
@@ -150,7 +147,7 @@ async function sendCommand(code) {
   feedback(code === 0 ? "Sending STOP…" : `Sending ${command.name}…`);
   try {
     await request("/status", { method: "POST", body: {
-      vehicleId: settings.vehicleId,
+      vehicleId,
       commandId: command?.commandId ?? null, // Null is a fail-safe stop if no STOP row exists.
       isConnected: true, source: "MANUAL",
     } });
@@ -166,6 +163,72 @@ async function sendCommand(code) {
     if (pending !== null) await sendCommand(pending);
   }
 }
+
+function finishVoice(session) {
+  if (voiceSession !== session) return false;
+  voiceSession = null;
+  const button = $("#voice-command");
+  button.textContent = "Voice command";
+  button.classList.toggle("listening", false);
+  return true;
+}
+
+function cancelVoice() {
+  if (!voiceSession) return;
+  const session = voiceSession;
+  finishVoice(session);
+  session.abort();
+  feedback("Listening cancelled.");
+}
+
+$("#voice-command").addEventListener("click", () => {
+  if (voiceSession) return cancelVoice();
+  if (gesture) return feedback("Release the stick before using voice.");
+  if (globalThis.isSecureContext === false) return feedback("Open the controller over HTTPS to use the microphone.", true);
+  const Recognition = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
+  if (!Recognition) return feedback("Voice recognition is unavailable in this browser.", true);
+
+  const session = new Recognition();
+  session.lang = "en-US";
+  session.continuous = false;
+  session.interimResults = false;
+  voiceSession = session;
+  const button = $("#voice-command");
+  button.textContent = "Cancel listening";
+  button.classList.toggle("listening", true);
+  feedback("Say one word: forward, backward, left, right, rise, lower, lights, sound or stop. Movement continues until stopped or replaced.");
+
+  session.onresult = event => {
+    const result = event.results[event.resultIndex];
+    if (!result?.isFinal || !finishVoice(session)) return;
+    const word = result[0].transcript.trim().replace(/[.!?]+$/, "").trim().toUpperCase();
+    const code = voiceWords.indexOf(word);
+    if (code < 0) return feedback("Unrecognized command. Nothing sent.");
+    if (code !== 0 && !connected) return feedback("API unavailable. Voice command dropped.", true);
+    sendCommand(code);
+  };
+  session.onnomatch = () => {
+    if (finishVoice(session)) feedback("Unrecognized command. Nothing sent.");
+  };
+  session.onerror = event => {
+    if (!finishVoice(session)) return;
+    const messages = {
+      "not-allowed": "Allow microphone access to use voice commands.",
+      "service-not-allowed": "Speech recognition is blocked in this browser.",
+      "audio-capture": "No microphone available.",
+      "no-speech": "No speech detected. Tap Voice command to try again.",
+    };
+    feedback(messages[event.error] || "Speech recognition failed. Tap Voice command to try again.", true);
+  };
+  session.onend = () => {
+    if (finishVoice(session)) feedback("Listening ended. Nothing sent.");
+  };
+  try { session.start(); }
+  catch {
+    finishVoice(session);
+    feedback("Could not start the microphone. Check browser permissions and try again.", true);
+  }
+});
 
 // Render API-provided text using textContent, never HTML interpolation.
 function node(tag, text, className) {
@@ -217,7 +280,7 @@ function confirmAction(title, message) {
 
 async function loadHistory() {
   const currentEpoch = epoch;
-  const rows = await request(`/history/${settings.vehicleId}`);
+  const rows = await request(`/history/${vehicleId}`);
   if (currentEpoch !== epoch) return;
   table($("#history-table"), ["ID", "COMMAND", "CODE", "TIME", "SOURCE"], rows.map((r) => [r.historyId, r.commandName, r.code, formatTime(r.timestamp), r.source]));
   feedback(`${rows.length} history records loaded.`, false, true);
@@ -225,7 +288,7 @@ async function loadHistory() {
 
 async function loadCommands() {
   const currentEpoch = epoch;
-  const rows = await request(`/commands/vehicle/${settings.vehicleId}`);
+  const rows = await request(`/commands/vehicle/${vehicleId}`);
   if (currentEpoch !== epoch) return;
   commands = rows;
   refreshButtons();
@@ -256,7 +319,7 @@ function editCommand(command) {
 
 async function loadDemos() {
   const currentEpoch = epoch;
-  const demos = await request(`/demos/vehicle/${settings.vehicleId}`);
+  const demos = await request(`/demos/vehicle/${vehicleId}`);
   if (currentEpoch !== epoch) return;
   $("#demo-list").replaceChildren();
   if (!demos.length) $("#demo-list").append(node("p", "No demos yet. Add one in All endpoints.", "empty"));
@@ -266,7 +329,7 @@ async function loadDemos() {
     description.append(node("h3", demo.name), node("p", demo.description || `Demo #${demo.demoId}`));
     const movements = node("div", undefined, "table-container");
     const run = actionButton("Run demo ↗", async () => {
-      if (!await confirmAction("Run vehicle demo?", `Run ${demo.name} on vehicle ${settings.vehicleId}? This will move the vehicle. Use the main STOP button or Space to interrupt it.`)) return feedback("Demo cancelled.", false, true);
+      if (!await confirmAction("Run vehicle demo?", `Run ${demo.name} on vehicle ${vehicleId}? This will move the vehicle. Use the main STOP button or Space to interrupt it.`)) return feedback("Demo cancelled.", false, true);
       await request(`/demos/${demo.demoId}/run`, { method: "POST" });
       $("#menu-dialog").close();
       feedback(`${demo.name} started. STOP interrupts the ESP’s execution.`);
@@ -293,7 +356,7 @@ function exampleBody(definition) {
   if (Object.hasOwn(resolved, "default")) return resolved.default;
   if (resolved.enum) return resolved.enum[0];
   if (resolved.type === "object") return Object.fromEntries(Object.entries(resolved.properties || {}).map(([key, value]) => {
-    if (key === "vehicleId") return [key, settings.vehicleId];
+    if (key === "vehicleId") return [key, vehicleId];
     if (key === "source") return [key, "MANUAL"];
     if (key === "durationMs") return [key, 500];
     return [key, exampleBody(value)];
@@ -325,7 +388,7 @@ function showEndpoint() {
     input.required = parameter.required;
     input.type = ["integer", "number"].includes(parameter.schema?.type) ? "number" : "text";
     if (input.type === "number") { input.step = "1"; input.min = "1"; }
-    if (parameter.name === "vehicle_id") input.value = settings.vehicleId;
+    if (parameter.name === "vehicle_id") input.value = vehicleId;
     label.append(input); $("#endpoint-params").append(label);
   }
   const bodySchema = endpoint.requestBody?.content?.["application/json"]?.schema;
@@ -353,15 +416,15 @@ $$("[data-code]").forEach((button) => button.addEventListener("click", () => {
   }
   sendCommand(code);
 }));
-$("#open-menu").addEventListener("click", () => { releaseStick(); $("#menu-dialog").showModal(); showView(activeView); });
+$("#open-menu").addEventListener("click", () => { cancelVoice(); releaseStick(); $("#menu-dialog").showModal(); showView(activeView); });
 $(".close-dialog").addEventListener("click", () => $("#menu-dialog").close());
 $$("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
 $("#connection-form").addEventListener("submit", (event) => {
   event.preventDefault();
   menuTask(async () => {
     if (sending) throw new Error("Wait for the pending command before changing connection.");
-    settings = validateSettings($("#api-url").value.trim(), $("#vehicle-input").value);
-    try { localStorage.setItem("indiscipline.connection", JSON.stringify(settings)); } catch { /* Session still works without storage. */ }
+    vehicleId = validateVehicleId($("#vehicle-input").value);
+    try { localStorage.setItem("indiscipline.connection", JSON.stringify({ vehicleId })); } catch { /* Session still works without storage. */ }
     await connect(); feedback("Connection settings applied.", false, true);
   }, event.submitter);
 });
@@ -378,7 +441,7 @@ $("#command-form").addEventListener("submit", (event) => {
   menuTask(async () => {
     const id = $("#command-id").value;
     const body = { name: $("#command-name").value.trim(), code: Number($("#command-code").value), description: $("#command-description").value.trim() || null };
-    if (id) body.isActive = $("#command-active").checked; else body.vehicleId = settings.vehicleId;
+    if (id) body.isActive = $("#command-active").checked; else body.vehicleId = vehicleId;
     if (!body.name) throw new Error("Command name cannot be blank.");
     await request(id ? `/commands/${id}` : "/commands", { method: id ? "PUT" : "POST", body });
     $("#command-form").hidden = true; await loadCommands(); feedback("Command saved.", false, true);
@@ -414,7 +477,7 @@ async function refreshPrograms() {
   const select = $("#program");
   const previous = select.value;
   try {
-    const demos = await request(`/demos/vehicle/${settings.vehicleId}`);
+    const demos = await request(`/demos/vehicle/${vehicleId}`);
     if (generation !== epoch) return;
     select.replaceChildren(new Option("Select demo", ""));
     for (const demo of demos.filter(demo => demo.isActive)) {
@@ -432,6 +495,7 @@ $("#program").addEventListener("focus", refreshPrograms);
 $("#run-program").addEventListener("click", async event => {
   const id = $("#program").value;
   if (!id || sending || gesture) return feedback("Select a demo and release the controls first.");
+  cancelVoice();
   const button = event.currentTarget;
   button.disabled = true;
   try {
@@ -478,6 +542,7 @@ for (const stick of $$(".stick")) {
   }
   stick.addEventListener("pointerdown", event => {
     if (event.button !== 0 || gesture || sending || !connected) return;
+    cancelVoice();
     gesture = {stick, pointer:event.pointerId};
     stick.setPointerCapture(event.pointerId);
     stick.classList.add("held");
@@ -511,6 +576,6 @@ document.addEventListener("keydown", event => {
   moveStick(...direction);
 });
 document.addEventListener("keyup", event => { if (gesture?.key === event.key) releaseStick(); });
-document.addEventListener("visibilitychange", () => { if (document.hidden) releaseStick(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { cancelVoice(); releaseStick(); } });
 document.defaultView?.addEventListener("blur", releaseStick);
 connect();

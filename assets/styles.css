@@ -49,6 +49,8 @@ body {
 .lever .knob{width:44%;height:20%;border-radius:7px;background:linear-gradient(#88897a,#595b4f 42%,#35372e)}
 .switches button,.program button {background:#282a23;color:#fff1bc;border:1px solid #50472d;border-radius:6px;padding:6px 12px;min-height:32px;font-weight:700}
 .switches [data-code="0"]{color:white;background:#7c3023}
+.switches {flex-wrap:wrap;gap:6px}
+#voice-command.listening {background:var(--white);color:var(--ink)}
 .program select {width:auto;max-width:56%;padding:5px;border-radius:4px}
 #feedback{margin:0;text-align:center;font-size:11px;line-height:1.2;min-height:1.2em}
 @media (orientation:landscape) {

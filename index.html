@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f5ca20">
   <title>Indiscipline — Vehicle control</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="assets/styles.css">
   <link rel="icon" href="assets/img/favico.ico" type="image/x-icon">
-  <script src="app.js" defer></script>
+  <script src="assets/app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -21,7 +21,7 @@
       <section class="station"><h2>Drive</h2><div class="stick" id="drive" tabindex="0" role="group" aria-label="Drive joystick. Drag or hold an arrow key. Release to stop."><b class="north">▲</b><b class="west">◀</b><b class="east">▶</b><b class="south">▼</b><i class="knob"></i></div></section>
       <section class="station"><h2>Load</h2><div class="stick lever" id="load" tabindex="0" role="group" aria-label="Load lever. Drag or hold an up or down arrow. Release to stop."><b class="north">RAISE</b><b class="south">LOWER</b><i class="knob"></i></div></section>
     </div>
-    <div class="switches"><button data-code="7">☀ Lights</button><button data-code="0">■ Stop</button><button data-code="8">♫ Sound</button></div>
+    <div class="switches"><button data-code="7">☀ Lights</button><button data-code="0">■ Stop</button><button data-code="8">♫ Sound</button><button id="voice-command" type="button">Voice command</button></div>
     <div class="program"><select id="program" aria-label="Select a demo"><option value="">Select demo</option></select><button id="run-program">Run demo</button></div>
     <p id="feedback" role="status"></p>
   </main>
@@ -33,8 +33,8 @@
     </nav>
     <p id="menu-feedback" class="menu-feedback" role="status" aria-live="polite"></p>
     <section id="view-connection" class="menu-view">
-      <p>Connect this controller to your Python API and choose the same vehicle ID configured on the ESP.</p>
-      <form id="connection-form" class="form-grid"><label class="full">API address<input id="api-url" type="url" required placeholder="http://192.168.1.100:8000"></label><label>Vehicle ID<input id="vehicle-input" type="number" min="1" step="1" required></label><button class="primary-button" type="submit">Save & connect ↗</button></form>
+      <p>Choose the vehicle ID configured on the ESP.</p>
+      <form id="connection-form" class="form-grid"><label>Vehicle ID<input id="vehicle-input" type="number" min="1" step="1" required></label><button class="primary-button" type="submit">Save & connect ↗</button></form>
       <div class="info-box">The ESP owns the vehicle’s WebSocket connection. This page uses AJAX and polls status every 2 seconds. A reachable API does not confirm that the ESP is connected.</div>
       <button id="check-health" class="secondary-button">Check API health</button><pre id="health-result" hidden></pre>
     </section>
