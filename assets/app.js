@@ -118,7 +118,8 @@ function commandFor(code) {
 }
 
 function refreshButtons() {
-  $("#voice-command").disabled = locked();
+  $("#voice-command").disabled = !voiceSession && (locked() || !!gesture);
+  tiltButton.disabled = !gesture?.tilt && (locked() || !!voiceSession || !!gesture);
   $("#run-program").disabled = locked();
   for (const button of $$(".demo-run")) button.disabled = locked() || button.dataset.active !== "true";
   for (const stick of $$(".stick")) stick.setAttribute("aria-disabled", String(locked(gesture?.stick === stick)));
@@ -184,8 +185,8 @@ async function connect() {
 }
 
 async function sendCommand(code, owner = null) {
-  cancelVoice();
-  const held = owner !== null && owner === gesture;
+  if (code === 0) cancelVoice();
+  const held = owner !== null && (owner === gesture || owner === voiceSession);
   if (code !== 0 && (locked(held) || stopQueued)) return;
   if (sending) {
     if (held && code !== 0) owner.pending = code;
@@ -208,11 +209,11 @@ async function sendCommand(code, owner = null) {
   } catch (error) { feedback(error.message, true); }
   finally {
     sending = false;
-    const pending = stopQueued ? 0 : owner === gesture ? owner?.pending : null;
+    const pending = stopQueued ? 0 : (owner === gesture || owner === voiceSession) ? owner?.pending : null;
     if (owner) owner.pending = null;
     stopQueued = false;
     refreshButtons();
-    if (pending != null && pending !== code) await sendCommand(pending, owner);
+    if (pending != null && (pending !== code || owner === voiceSession)) await sendCommand(pending, owner);
   }
 }
 
@@ -234,7 +235,7 @@ function cancelVoice() {
 }
 
 $("#voice-command").addEventListener("click", () => {
-  if (voiceSession) return cancelVoice();
+  if (voiceSession) return sendCommand(0);
   if (gesture) return feedback("Release the stick before using voice.");
   if (globalThis.isSecureContext === false) return feedback("Open the controller over HTTPS to use the microphone.", true);
   const Recognition = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
@@ -242,28 +243,31 @@ $("#voice-command").addEventListener("click", () => {
 
   const session = new Recognition();
   session.lang = "en-US";
-  session.continuous = false;
+  session.continuous = true;
   session.interimResults = false;
   voiceSession = session;
   const button = $("#voice-command");
-  button.textContent = "Cancel listening";
+  button.textContent = "Stop listening and driving";
+  refreshButtons();
   button.classList.toggle("listening", true);
   feedback("Say one word: forward, backward, left, right, rise, lower, lights, sound or stop. Movement continues until stopped or replaced.");
 
   session.onresult = event => {
-    const result = event.results[event.resultIndex];
-    if (!result?.isFinal || !finishVoice(session)) return;
-    const word = result[0].transcript.trim().replace(/[.!?]+$/, "").trim().toUpperCase();
-    const code = voiceWords.indexOf(word);
-    if (code < 0) return feedback("Unrecognized command. Nothing sent.");
-    if (code !== 0 && !connected) return feedback("API unavailable. Voice command dropped.", true);
-    sendCommand(code);
+    for (let i = event.resultIndex; i < event.results.length && session === voiceSession; i++) {
+      const result = event.results[i];
+      if (!result.isFinal) continue;
+      const word = result[0].transcript.trim().replace(/[.!?]+$/, "").trim().toUpperCase();
+      const code = voiceWords.indexOf(word);
+      if (code >= 0) sendCommand(code, session);
+      else feedback("Unrecognized command. Still listening.");
+    }
   };
   session.onnomatch = () => {
-    if (finishVoice(session)) feedback("Unrecognized command. Nothing sent.");
+    if (voiceSession === session) feedback("Unrecognized command. Still listening.");
   };
   session.onerror = event => {
-    if (!finishVoice(session)) return;
+    if (event.error === "no-speech" || voiceSession !== session) return;
+    sendCommand(0);
     const messages = {
       "not-allowed": "Allow microphone access to use voice commands.",
       "service-not-allowed": "Speech recognition is blocked in this browser.",
@@ -273,7 +277,9 @@ $("#voice-command").addEventListener("click", () => {
     feedback(messages[event.error] || "Speech recognition failed. Tap Voice command to try again.", true);
   };
   session.onend = () => {
-    if (finishVoice(session)) feedback("Listening ended. Nothing sent.");
+    if (voiceSession !== session) return;
+    try { session.start(); }
+    catch { sendCommand(0); feedback("Microphone disconnected.", true); }
   };
   try { session.start(); }
   catch {
@@ -463,7 +469,7 @@ async function showView(view) {
 
 $$("[data-code]").forEach((button) => button.addEventListener("click", () => {
   const code = Number(button.dataset.code);
-  if (gesture) {
+  if (gesture && !(gesture.tilt && code !== 0 && !gesture.code)) {
     if (code === 0) releaseStick();
     else feedback("Release the stick before toggling equipment.");
     return;
@@ -567,21 +573,27 @@ $("#run-program").addEventListener("click", async event => {
 });
 
 let gesture = null;
-let tiltEnabled = false;
+
 let sensorTimeout;
 const tiltButton = $("#tilt-mode");
 tiltButton.addEventListener("click", async () => {
-  releaseStick();
-  if (!tiltEnabled) {
+  if (gesture?.tilt) return releaseStick();
+  if (locked() || voiceSession || gesture) return;
+  {
     const sensor = globalThis.DeviceMotionEvent;
     if (!globalThis.isSecureContext || !sensor) return feedback("Tilt requires HTTPS and a phone with motion sensors.", true);
     try {
       if (sensor.requestPermission && await sensor.requestPermission() !== "granted") return feedback("Motion permission was declined.", true);
     } catch { return feedback("Motion sensors are unavailable.", true); }
   }
-  tiltEnabled = !tiltEnabled;
-  tiltButton.setAttribute("aria-pressed", String(tiltEnabled));
-  feedback(tiltEnabled ? "Hold Drive or Load at your resting angle. Tilt to move. Release to stop." : "Touch joysticks enabled.");
+  if (locked() || voiceSession || gesture || document.hidden) return;
+  gesture = {stick: $("#drive"), tilt: true};
+  tiltButton.setAttribute("aria-pressed", "true");
+  tiltButton.textContent = "Stop tilt control";
+  awaitMotion(gesture);
+  refreshButtons();
+  feedback("Hold still to set neutral. Tilt to drive or shake repeatedly to raise the load.");
+
 });
 
 function awaitMotion(owner) {
@@ -589,18 +601,44 @@ function awaitMotion(owner) {
   sensorTimeout = setTimeout(() => {
     if (gesture !== owner) return;
     releaseStick();
-    feedback("Motion signal lost. Release and hold again.", true);
-  }, 800);
+    feedback("Motion signal lost. Tap Tilt control to restart.", true);
+  }, owner.neutral ? 1500 : 5000);
 }
 
 function handleTilt(event) {
   const owner = gesture;
   if (!owner?.tilt) return;
+  if (locked(true)) return releaseStick();
+  if (sending && !owner.code) return;
   const g = event.accelerationIncludingGravity;
   if (!g || ![g.x,g.y,g.z].every(Number.isFinite)) return;
   const magnitude = Math.hypot(g.x,g.y,g.z);
-  if (magnitude < 7 || magnitude > 13) return;
+  if (magnitude < 0.1) return;
   awaitMotion(owner);
+  const now = Date.now();
+  const a = event.acceleration;
+  const impulse = a && [a.x,a.y,a.z].every(Number.isFinite)
+    ? Math.hypot(a.x,a.y,a.z) : Math.abs(magnitude - 9.81);
+  if (owner.neutral && impulse > 8 && !owner.peak) {
+    owner.peak = true;
+    if (now - owner.lastPeak < 650 && !stopQueued && !locked(true)) {
+      owner.lastShake = now;
+      if (owner.code !== 5 && commandFor(5)) {
+        owner.code = 5;
+        sendCommand(5, owner);
+      }
+    }
+    owner.lastPeak = now;
+  }
+  if (impulse < 4) owner.peak = false;
+  if (now - owner.lastShake < 350) return;
+  if (owner.code === 5) {
+    owner.code = 0;
+    owner.pending = null;
+    sendCommand(0, owner);
+    return;
+  }
+  if (impulse > 8 || magnitude < 7 || magnitude > 13) return;
   const angle = (globalThis.screen?.orientation?.angle ?? globalThis.orientation ?? 0) * Math.PI / 180;
   const x = (g.x * Math.cos(angle) + g.y * Math.sin(angle)) / magnitude;
   const y = (g.y * Math.cos(angle) - g.x * Math.sin(angle)) / magnitude;
@@ -632,6 +670,10 @@ document.defaultView?.addEventListener("devicemotion", handleTilt);
 function releaseStick() {
   if (!gesture) return;
   const { stick, pointer } = gesture;
+  if (gesture.tilt) {
+    tiltButton.setAttribute("aria-pressed", "false");
+    tiltButton.textContent = "Tilt control";
+  }
   clearTimeout(sensorTimeout);
   gesture = null;
   stick.classList.remove("held");
@@ -667,11 +709,10 @@ for (const stick of $$(".stick")) {
   stick.addEventListener("pointerdown", event => {
     if (event.button !== 0 || gesture || locked()) return;
     cancelVoice();
-    gesture = {stick, pointer:event.pointerId, tilt:tiltEnabled};
+    gesture = {stick, pointer:event.pointerId};
     stick.setPointerCapture(event.pointerId);
     stick.classList.add("held");
-    if (gesture.tilt) awaitMotion(gesture);
-    else track(event);
+    track(event);
   });
   stick.addEventListener("pointermove", event => {
     if (gesture?.stick === stick && !gesture.tilt && gesture.pointer === event.pointerId) track(event);
