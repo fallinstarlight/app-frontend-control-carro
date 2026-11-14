@@ -19,7 +19,7 @@ let healthTimer, reconnectTimer, pulseTimer;
 let databaseOnline = false, streamReady = false, commandActive = false, demoActive = false, demoPending = false;
 
 function locked(held = false) {
-  return !connected || !databaseOnline || !streamReady || (!held && (sending || commandActive)) || demoActive || demoPending;
+  return planning || !!llmSession || !connected || !databaseOnline || !streamReady || (!held && (sending || commandActive)) || demoActive || demoPending;
 }
 
 function indicator(id, label, online) {
@@ -72,6 +72,8 @@ let schema;
 let endpoints = [];
 const voiceWords = ["STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "RISE", "LOWER", "LIGHTS", "SOUND"];
 let voiceSession = null;
+let llmSession = null;
+let planning = false;
 
 function validateVehicleId(id) {
   const vehicleId = Number(id);
@@ -85,13 +87,13 @@ function feedback(message, error = false, menu = false) {
   target.classList.toggle("error", error);
 }
 
-async function request(path, { method = "GET", body } = {}) {
+async function request(path, { method = "GET", body, timeout = 8000 } = {}) {
   let response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       method, headers: body === undefined ? {} : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(8000), cache: "no-store",
+      signal: AbortSignal.timeout(timeout), cache: "no-store",
     });
   } catch (error) {
     throw new Error((method === "GET" ? "API unreachable." : "Request outcome unknown; it may have reached the API. Check status before retrying.") + " Check your connection and the API server.");
@@ -118,8 +120,8 @@ function commandFor(code) {
 }
 
 function refreshButtons() {
+  $("#llm-command").disabled = !llmSession && (locked() || !!gesture || !!voiceSession);
   $("#voice-command").disabled = !voiceSession && (locked() || !!gesture);
-  tiltButton.disabled = !gesture?.tilt && (locked() || !!voiceSession || !!gesture);
   $("#run-program").disabled = locked();
   for (const button of $$(".demo-run")) button.disabled = locked() || button.dataset.active !== "true";
   for (const stick of $$(".stick")) stick.setAttribute("aria-disabled", String(locked(gesture?.stick === stick)));
@@ -185,7 +187,7 @@ async function connect() {
 }
 
 async function sendCommand(code, owner = null) {
-  if (code === 0) cancelVoice();
+  if (code === 0) { cancelVoice(); cancelLlmListening(); }
   const held = owner !== null && (owner === gesture || owner === voiceSession);
   if (code !== 0 && (locked(held) || stopQueued)) return;
   if (sending) {
@@ -286,6 +288,59 @@ $("#voice-command").addEventListener("click", () => {
     finishVoice(session);
     feedback("Could not start the microphone. Check browser permissions and try again.", true);
   }
+});
+
+function cancelLlmListening() {
+  if (!llmSession) return;
+  const session = llmSession;
+  llmSession = null;
+  session.abort();
+  $("#llm-command").textContent = "LLM voice demo";
+  refreshButtons();
+}
+
+$("#llm-command").addEventListener("click", () => {
+  if (llmSession) return cancelLlmListening();
+  if (locked() || gesture || voiceSession) return;
+  const Recognition = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
+  if (!Recognition || !globalThis.isSecureContext) return feedback("LLM voice demos require HTTPS and browser speech recognition.", true);
+  const session = new Recognition();
+  llmSession = session;
+  session.lang = "en-US";
+  const button = $("#llm-command");
+  button.textContent = "Cancel LLM listening";
+  refreshButtons();
+  feedback("Describe the sequence of movements.");
+  session.onresult = async event => {
+    if (llmSession !== session) return;
+    const result = event.results[event.resultIndex];
+    if (!result.isFinal) return;
+    const transcript = result[0].transcript.trim();
+    cancelLlmListening();
+    if (!transcript || locked()) return feedback("No demo submitted.");
+    planning = true;
+    refreshButtons();
+    feedback("Planning demo…");
+    try {
+      const run = await request("/demos/voice", {method:"POST", body:{vehicleId, transcript}, timeout:45000});
+      feedback(`Demo #${run.demoId} started with ${run.totalMovements} movements.`);
+    } catch (error) { feedback(error.message, true); }
+    finally { planning = false; refreshButtons(); }
+  };
+  session.onerror = event => {
+    if (llmSession !== session) return;
+    cancelLlmListening();
+    feedback(`Speech recognition failed (${event.error}).`, true);
+  };
+  session.onend = () => {
+    if (llmSession !== session) return;
+    llmSession = null;
+    button.textContent = "LLM voice demo";
+    refreshButtons();
+    feedback("No demo submitted.");
+  };
+  try { session.start(); }
+  catch { cancelLlmListening(); feedback("Microphone unavailable.", true); }
 });
 
 // Render API-provided text using textContent, never HTML interpolation.
@@ -469,20 +524,20 @@ async function showView(view) {
 
 $$("[data-code]").forEach((button) => button.addEventListener("click", () => {
   const code = Number(button.dataset.code);
-  if (gesture && !(gesture.tilt && code !== 0 && !gesture.code)) {
+  if (gesture) {
     if (code === 0) releaseStick();
     else feedback("Release the stick before toggling equipment.");
     return;
   }
   sendCommand(code);
 }));
-$("#open-menu").addEventListener("click", () => { cancelVoice(); releaseStick(); $("#menu-dialog").showModal(); showView(activeView); });
+$("#open-menu").addEventListener("click", () => { cancelLlmListening(); cancelVoice(); releaseStick(); $("#menu-dialog").showModal(); showView(activeView); });
 $(".close-dialog").addEventListener("click", () => $("#menu-dialog").close());
 $$("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
 $("#connection-form").addEventListener("submit", (event) => {
   event.preventDefault();
   menuTask(async () => {
-    if (sending) throw new Error("Wait for the pending command before changing connection.");
+    if (sending || planning) throw new Error("Wait for the pending command before changing connection.");
     vehicleId = validateVehicleId($("#vehicle-input").value);
     try { localStorage.setItem("indiscipline.connection", JSON.stringify({ vehicleId })); } catch { /* Session still works without storage. */ }
     await connect(); feedback("Connection settings applied.", false, true);
@@ -574,107 +629,9 @@ $("#run-program").addEventListener("click", async event => {
 
 let gesture = null;
 
-let sensorTimeout;
-const tiltButton = $("#tilt-mode");
-tiltButton.addEventListener("click", async () => {
-  if (gesture?.tilt) return releaseStick();
-  if (locked() || voiceSession || gesture) return;
-  {
-    const sensor = globalThis.DeviceMotionEvent;
-    if (!globalThis.isSecureContext || !sensor) return feedback("Tilt requires HTTPS and a phone with motion sensors.", true);
-    try {
-      if (sensor.requestPermission && await sensor.requestPermission() !== "granted") return feedback("Motion permission was declined.", true);
-    } catch { return feedback("Motion sensors are unavailable.", true); }
-  }
-  if (locked() || voiceSession || gesture || document.hidden) return;
-  gesture = {stick: $("#drive"), tilt: true};
-  tiltButton.setAttribute("aria-pressed", "true");
-  tiltButton.textContent = "Stop tilt control";
-  awaitMotion(gesture);
-  refreshButtons();
-  feedback("Hold still to set neutral. Tilt to drive or shake repeatedly to raise the load.");
-
-});
-
-function awaitMotion(owner) {
-  clearTimeout(sensorTimeout);
-  sensorTimeout = setTimeout(() => {
-    if (gesture !== owner) return;
-    releaseStick();
-    feedback("Motion signal lost. Tap Tilt control to restart.", true);
-  }, owner.neutral ? 1500 : 5000);
-}
-
-function handleTilt(event) {
-  const owner = gesture;
-  if (!owner?.tilt) return;
-  if (locked(true)) return releaseStick();
-  if (sending && !owner.code) return;
-  const g = event.accelerationIncludingGravity;
-  if (!g || ![g.x,g.y,g.z].every(Number.isFinite)) return;
-  const magnitude = Math.hypot(g.x,g.y,g.z);
-  if (magnitude < 0.1) return;
-  awaitMotion(owner);
-  const now = Date.now();
-  const a = event.acceleration;
-  const impulse = a && [a.x,a.y,a.z].every(Number.isFinite)
-    ? Math.hypot(a.x,a.y,a.z) : Math.abs(magnitude - 9.81);
-  if (owner.neutral && impulse > 8 && !owner.peak) {
-    owner.peak = true;
-    if (now - owner.lastPeak < 650 && !stopQueued && !locked(true)) {
-      owner.lastShake = now;
-      if (owner.code !== 5 && commandFor(5)) {
-        owner.code = 5;
-        sendCommand(5, owner);
-      }
-    }
-    owner.lastPeak = now;
-  }
-  if (impulse < 4) owner.peak = false;
-  if (now - owner.lastShake < 350) return;
-  if (owner.code === 5) {
-    owner.code = 0;
-    owner.pending = null;
-    sendCommand(0, owner);
-    return;
-  }
-  if (impulse > 8 || magnitude < 7 || magnitude > 13) return;
-  const angle = (globalThis.screen?.orientation?.angle ?? globalThis.orientation ?? 0) * Math.PI / 180;
-  const x = (g.x * Math.cos(angle) + g.y * Math.sin(angle)) / magnitude;
-  const y = (g.y * Math.cos(angle) - g.x * Math.sin(angle)) / magnitude;
-  const pitch = Math.atan2(g.z / magnitude,y);
-  if (!owner.neutral) {
-    owner.neutral = {x,pitch,angle};
-    return;
-  }
-  if (owner.neutral.angle !== angle) return releaseStick();
-  const roll = owner.neutral.x - x;
-  const forward = Math.sin(pitch - owner.neutral.pitch);
-  const strength = owner.stick.id === "load" ? Math.abs(forward) : Math.max(Math.abs(roll), Math.abs(forward));
-  if (strength < 0.13) {
-    if (owner.code) {
-      owner.code = 0;
-      owner.pending = null;
-      sendCommand(0, owner);
-    }
-    return;
-  }
-  // A deliberate quick rotation can engage at a smaller tilt.
-  const rate = event.rotationRate;
-  const angularSpeed = Math.hypot(rate?.alpha || 0, rate?.beta || 0, rate?.gamma || 0);
-  const threshold = angularSpeed >= 45 ? 0.19 : 0.24;
-  if (strength < threshold || stopQueued || (sending && owner.code === 0)) return;
-  moveStick(roll, -forward);
-}
-document.defaultView?.addEventListener("devicemotion", handleTilt);
 function releaseStick() {
   if (!gesture) return;
   const { stick, pointer } = gesture;
-  if (gesture.tilt) {
-    tiltButton.setAttribute("aria-pressed", "false");
-    tiltButton.textContent = "Tilt control";
-  }
-  clearTimeout(sensorTimeout);
   gesture = null;
   stick.classList.remove("held");
   stick.style.removeProperty("--x");
@@ -715,7 +672,7 @@ for (const stick of $$(".stick")) {
     track(event);
   });
   stick.addEventListener("pointermove", event => {
-    if (gesture?.stick === stick && !gesture.tilt && gesture.pointer === event.pointerId) track(event);
+    if (gesture?.stick === stick && gesture.pointer === event.pointerId) track(event);
   });
   for (const type of ["pointerup","pointercancel","lostpointercapture"]) {
     stick.addEventListener(type, event => {
@@ -742,6 +699,6 @@ document.addEventListener("keydown", event => {
   moveStick(...direction);
 });
 document.addEventListener("keyup", event => { if (gesture?.key === event.key) releaseStick(); });
-document.addEventListener("visibilitychange", () => { if (document.hidden) { cancelVoice(); releaseStick(); } });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { cancelLlmListening(); cancelVoice(); releaseStick(); } });
 document.defaultView?.addEventListener("blur", releaseStick);
 connect();
