@@ -12,10 +12,62 @@ let commands = [];
 let connected = false;
 let sending = false;
 let stopQueued = false;
-let nextDirection = null;
 let activeView = "connection";
 let epoch = 0;
-let pollTimer;
+let socket;
+let healthTimer, reconnectTimer, pulseTimer;
+let databaseOnline = false, streamReady = false, commandActive = false, demoActive = false, demoPending = false;
+
+function locked(held = false) {
+  return !connected || !databaseOnline || !streamReady || (!held && (sending || commandActive)) || demoActive || demoPending;
+}
+
+function indicator(id, label, online) {
+  $(`#${id}-dot`).classList.toggle("online", online);
+  $(`#${id}-label`).textContent = label + (online ? " reachable" : " unavailable");
+}
+
+async function checkHealth(generation) {
+  const [api, db] = await Promise.allSettled([request("/"), request("/health/database")]);
+  if (generation !== epoch) return;
+  databaseOnline = db.status === "fulfilled";
+  indicator("database", "Database", databaseOnline);
+  setConnected(api.status === "fulfilled");
+  if (databaseOnline && !commands.length) {
+    try {
+      const loaded = await request(`/commands/vehicle/${vehicleId}`);
+      if (generation !== epoch) return;
+      commands = loaded;
+      refreshButtons();
+    } catch { /* Retry on the next health check. */ }
+  }
+  if (generation === epoch) healthTimer = setTimeout(() => checkHealth(generation), 5000);
+}
+
+function watchStatus(generation) {
+  socket = new WebSocket(API_BASE_URL.replace(/^http/, "ws") + "/ws/status/" + vehicleId);
+  socket.onopen = () => { if (generation === epoch) indicator("socket", "WebSocket", true); };
+  socket.onmessage = ({data}) => {
+    if (generation !== epoch) return;
+    const event = JSON.parse(data);
+    if (event.event === "state") {
+      streamReady = true;
+      if (event.snapshot) demoActive = event.demoActive;
+      displayStatus(event);
+    }
+    if (event.event === "demo_start") demoActive = true;
+    if (["demo_end", "demo_error"].includes(event.event)) demoActive = false;
+    refreshButtons();
+  };
+  socket.onclose = () => {
+    if (generation !== epoch) return;
+    streamReady = false;
+    indicator("socket", "WebSocket", false);
+    refreshButtons();
+    reconnectTimer = setTimeout(() => watchStatus(generation), 1500);
+  };
+}
+
 let schema;
 let endpoints = [];
 const voiceWords = ["STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "RISE", "LOWER", "LIGHTS", "SOUND"];
@@ -66,15 +118,26 @@ function commandFor(code) {
 }
 
 function refreshButtons() {
+  $("#voice-command").disabled = locked();
+  $("#run-program").disabled = locked();
+  for (const button of $$(".demo-run")) button.disabled = locked() || button.dataset.active !== "true";
+  for (const stick of $$(".stick")) stick.setAttribute("aria-disabled", String(locked(gesture?.stick === stick)));
   $$("[data-code]").forEach((button) => {
     const code = Number(button.dataset.code);
     // STOP remains available after a polling failure so it can still be attempted.
-    button.disabled = code === 0 ? stopQueued : (!connected || sending || !commandFor(code));
+    button.disabled = code === 0 ? stopQueued : (locked() || !commandFor(code));
     button.title = code !== 0 && !commandFor(code) ? `No active command with code ${code}. Configure it in Menu → Commands.` : "";
   });
 }
 
 function displayStatus(status) {
+  clearTimeout(pulseTimer);
+  const code = Number(status.code);
+  commandActive = status.source !== "DEMO" && code > 0;
+  if (code === 7 || code === 8) {
+    const elapsed = status.snapshot ? Date.now() - Date.parse(status.lastUpdate) : 0;
+    pulseTimer = setTimeout(() => { commandActive = false; refreshButtons(); }, Math.max(0, 500 - elapsed));
+  }
   $("#last-command").textContent = (status.commandName ?? "No command").replace(/_/g, " ");
   $$("[data-code]").forEach((button) => button.classList.toggle("active", Number(button.dataset.code) === status.code));
 }
@@ -85,33 +148,15 @@ function formatTime(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-async function pollStatus(currentEpoch = epoch) {
-  clearTimeout(pollTimer);
-  try {
-    const data = await request(`/status/${vehicleId}`);
-    if (currentEpoch !== epoch) return;
-    displayStatus(data);
-    setConnected(true);
-    // Recover command discovery too if the server was down when the page opened.
-    if (!commands.length) {
-      const loaded = await request(`/commands/vehicle/${vehicleId}`);
-      if (currentEpoch !== epoch) return;
-      commands = loaded;
-      refreshButtons();
-    }
-  } catch (error) {
-    if (currentEpoch !== epoch) return;
-    // A vehicle may exist without a status row before its first command.
-    if (error.message.startsWith("HTTP 404") && commands.length) setConnected(true);
-    else { setConnected(false); feedback(error.message, true); }
-  } finally {
-    if (currentEpoch === epoch) pollTimer = setTimeout(() => pollStatus(currentEpoch), 2000);
-  }
-}
-
 async function connect() {
   const currentEpoch = ++epoch;
-  clearTimeout(pollTimer);
+  clearTimeout(reconnectTimer);
+  clearTimeout(healthTimer);
+  socket?.close();
+  streamReady = demoActive = databaseOnline = false;
+  indicator("socket", "WebSocket", false);
+  indicator("database", "Database", false);
+  checkHealth(currentEpoch);
   commands = [];
   schema = undefined;
   setConnected(false);
@@ -130,14 +175,21 @@ async function connect() {
     const missing = Array.from({ length: 9 }, (_, i) => i).filter((code) => !commandFor(code));
     feedback(missing.length ? `Missing command codes: ${missing.join(", ")}. Open Menu → Commands.` : "Ready to send. Confirm ESP connection in the serial monitor.", Boolean(missing.length));
   } catch (error) { if (currentEpoch === epoch) feedback(error.message, true); }
-  if (currentEpoch === epoch) { refreshPrograms(); pollStatus(currentEpoch); }
+  if (currentEpoch === epoch) { refreshPrograms();
+    try {
+      const initial = await request(`/status/${vehicleId}`);
+      if (currentEpoch === epoch) displayStatus(initial);
+    } catch (error) { if (currentEpoch === epoch && !error.message.startsWith("HTTP 404")) feedback(error.message, true); }
+    if (currentEpoch === epoch) watchStatus(currentEpoch); }
 }
 
-async function sendCommand(code) {
+async function sendCommand(code, owner = null) {
   cancelVoice();
+  const held = owner !== null && owner === gesture;
+  if (code !== 0 && (locked(held) || stopQueued)) return;
   if (sending) {
-    if (code !== 0 && !stopQueued) nextDirection = code;
-    if (code === 0) { nextDirection = null; stopQueued = true; refreshButtons(); feedback("STOP queued immediately after the pending request."); }
+    if (held && code !== 0) owner.pending = code;
+    if (code === 0) { stopQueued = true; refreshButtons(); feedback("STOP queued immediately after the pending request."); }
     return;
   }
   const command = commandFor(code);
@@ -156,11 +208,11 @@ async function sendCommand(code) {
   } catch (error) { feedback(error.message, true); }
   finally {
     sending = false;
-    const pending = stopQueued || code === 7 || code === 8 ? 0 : nextDirection;
-    nextDirection = null;
+    const pending = stopQueued ? 0 : owner === gesture ? owner?.pending : null;
+    if (owner) owner.pending = null;
     stopQueued = false;
     refreshButtons();
-    if (pending !== null) await sendCommand(pending);
+    if (pending != null && pending !== code) await sendCommand(pending, owner);
   }
 }
 
@@ -330,11 +382,13 @@ async function loadDemos() {
     const movements = node("div", undefined, "table-container");
     const run = actionButton("Run demo ↗", async () => {
       if (!await confirmAction("Run vehicle demo?", `Run ${demo.name} on vehicle ${vehicleId}? This will move the vehicle. Use the main STOP button or Space to interrupt it.`)) return feedback("Demo cancelled.", false, true);
-      await request(`/demos/${demo.demoId}/run`, { method: "POST" });
+      await launchDemo(demo.demoId);
       $("#menu-dialog").close();
       feedback(`${demo.name} started. STOP interrupts the ESP’s execution.`);
     });
-    run.disabled = !demo.isActive;
+    run.classList.add("demo-run");
+    run.dataset.active = String(Boolean(demo.isActive));
+    run.disabled = locked() || !demo.isActive;
     const inspect = actionButton("View steps", async () => {
       const rows = await request(`/demos/${demo.demoId}/movements`);
       table(movements, ["ORDER", "COMMAND", "DURATION (ms)", "PAUSE (ms)"], rows.map((m) => [m.sortOrder, m.commandName, m.durationMs, m.pauseMs]));
@@ -492,6 +546,13 @@ async function refreshPrograms() {
   }
 }
 $("#program").addEventListener("focus", refreshPrograms);
+async function launchDemo(id) {
+  if (locked()) throw new Error("Controls are busy or unavailable.");
+  demoPending = true;
+  refreshButtons();
+  try { await request(`/demos/${id}/run`, {method:"POST"}); }
+  finally { demoPending = false; refreshButtons(); }
+}
 $("#run-program").addEventListener("click", async event => {
   const id = $("#program").value;
   if (!id || sending || gesture) return feedback("Select a demo and release the controls first.");
@@ -499,16 +560,79 @@ $("#run-program").addEventListener("click", async event => {
   const button = event.currentTarget;
   button.disabled = true;
   try {
-    await request(`/demos/${id}/run`, {method:"POST"});
+    await launchDemo(id);
     feedback("Demo started.");
   } catch (error) { feedback(error.message, true); }
-  finally { button.disabled = false; }
+  finally { refreshButtons(); }
 });
 
 let gesture = null;
+let tiltEnabled = false;
+let sensorTimeout;
+const tiltButton = $("#tilt-mode");
+tiltButton.addEventListener("click", async () => {
+  releaseStick();
+  if (!tiltEnabled) {
+    const sensor = globalThis.DeviceMotionEvent;
+    if (!globalThis.isSecureContext || !sensor) return feedback("Tilt requires HTTPS and a phone with motion sensors.", true);
+    try {
+      if (sensor.requestPermission && await sensor.requestPermission() !== "granted") return feedback("Motion permission was declined.", true);
+    } catch { return feedback("Motion sensors are unavailable.", true); }
+  }
+  tiltEnabled = !tiltEnabled;
+  tiltButton.setAttribute("aria-pressed", String(tiltEnabled));
+  feedback(tiltEnabled ? "Hold Drive or Load at your resting angle. Tilt to move. Release to stop." : "Touch joysticks enabled.");
+});
+
+function awaitMotion(owner) {
+  clearTimeout(sensorTimeout);
+  sensorTimeout = setTimeout(() => {
+    if (gesture !== owner) return;
+    releaseStick();
+    feedback("Motion signal lost. Release and hold again.", true);
+  }, 800);
+}
+
+function handleTilt(event) {
+  const owner = gesture;
+  if (!owner?.tilt) return;
+  const g = event.accelerationIncludingGravity;
+  if (!g || ![g.x,g.y,g.z].every(Number.isFinite)) return;
+  const magnitude = Math.hypot(g.x,g.y,g.z);
+  if (magnitude < 7 || magnitude > 13) return;
+  awaitMotion(owner);
+  const angle = (globalThis.screen?.orientation?.angle ?? globalThis.orientation ?? 0) * Math.PI / 180;
+  const x = (g.x * Math.cos(angle) + g.y * Math.sin(angle)) / magnitude;
+  const y = (g.y * Math.cos(angle) - g.x * Math.sin(angle)) / magnitude;
+  const pitch = Math.atan2(g.z / magnitude,y);
+  if (!owner.neutral) {
+    owner.neutral = {x,pitch,angle};
+    return;
+  }
+  if (owner.neutral.angle !== angle) return releaseStick();
+  const roll = owner.neutral.x - x;
+  const forward = Math.sin(pitch - owner.neutral.pitch);
+  const strength = owner.stick.id === "load" ? Math.abs(forward) : Math.max(Math.abs(roll), Math.abs(forward));
+  if (strength < 0.13) {
+    if (owner.code) {
+      owner.code = 0;
+      owner.pending = null;
+      sendCommand(0, owner);
+    }
+    return;
+  }
+  // A deliberate quick rotation can engage at a smaller tilt.
+  const rate = event.rotationRate;
+  const angularSpeed = Math.hypot(rate?.alpha || 0, rate?.beta || 0, rate?.gamma || 0);
+  const threshold = angularSpeed >= 45 ? 0.19 : 0.24;
+  if (strength < threshold || stopQueued || (sending && owner.code === 0)) return;
+  moveStick(roll, -forward);
+}
+document.defaultView?.addEventListener("devicemotion", handleTilt);
 function releaseStick() {
   if (!gesture) return;
   const { stick, pointer } = gesture;
+  clearTimeout(sensorTimeout);
   gesture = null;
   stick.classList.remove("held");
   stick.style.removeProperty("--x");
@@ -531,7 +655,7 @@ function moveStick(x, y) {
     : Math.abs(x) >= Math.abs(y) ? (x > 0 ? 4 : 3) : (y < 0 ? 1 : 2);
   if (gesture.code === code) return;
   gesture.code = code;
-  sendCommand(commandFor(code) ? code : 0);
+  sendCommand(commandFor(code) ? code : 0, gesture);
 }
 
 for (const stick of $$(".stick")) {
@@ -541,15 +665,16 @@ for (const stick of $$(".stick")) {
               (event.clientY-box.top-box.height/2)/(stick.clientWidth * 0.31));
   }
   stick.addEventListener("pointerdown", event => {
-    if (event.button !== 0 || gesture || sending || !connected) return;
+    if (event.button !== 0 || gesture || locked()) return;
     cancelVoice();
-    gesture = {stick, pointer:event.pointerId};
+    gesture = {stick, pointer:event.pointerId, tilt:tiltEnabled};
     stick.setPointerCapture(event.pointerId);
     stick.classList.add("held");
-    track(event);
+    if (gesture.tilt) awaitMotion(gesture);
+    else track(event);
   });
   stick.addEventListener("pointermove", event => {
-    if (gesture?.stick === stick && gesture.pointer === event.pointerId) track(event);
+    if (gesture?.stick === stick && !gesture.tilt && gesture.pointer === event.pointerId) track(event);
   });
   for (const type of ["pointerup","pointercancel","lostpointercapture"]) {
     stick.addEventListener(type, event => {
@@ -567,7 +692,7 @@ document.addEventListener("keydown", event => {
   }
   const direction = {ArrowUp:[0,-1],ArrowDown:[0,1],ArrowLeft:[-1,0],ArrowRight:[1,0],
                      w:[0,-1],s:[0,1],a:[-1,0],d:[1,0]}[event.key];
-  if (!direction || !connected || sending || gesture || event.repeat) return;
+  if (!direction || locked() || gesture || event.repeat) return;
   const stick = event.target.id === "load" ? $("#load") : $("#drive");
   if (stick.id === "load" && !direction[1]) return;
   event.preventDefault();

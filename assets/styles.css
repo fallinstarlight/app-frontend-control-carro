@@ -60,3 +60,12 @@ body {
  .readout,.sticks,#feedback {grid-column:1/-1}
 }
 @media(max-width:560px){.topbar-right .connection{font-size:10px}.brand{gap:4px}.form-grid{grid-template-columns:1fr}dialog{padding:14px}.menu-tabs button{padding:8px}.view-heading{flex-wrap:wrap}}
+
+#database-dot.online {background:#c62497}
+#socket-dot.online {background:#247bd3}
+.stick[aria-disabled="true"]:not(.held) {opacity:.68}
+@media(max-width:650px){
+  .topbar-right {display:grid;grid-template-columns:auto auto;gap:1px 6px}
+  .topbar-right .connection {grid-column:1;font-size:10px;line-height:12px}
+  .topbar-right .menu-button {grid-column:2;grid-row:1/4}
+}
