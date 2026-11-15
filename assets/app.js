@@ -306,7 +306,7 @@ $("#llm-command").addEventListener("click", () => {
   if (!Recognition || !globalThis.isSecureContext) return feedback("LLM voice demos require HTTPS and browser speech recognition.", true);
   const session = new Recognition();
   llmSession = session;
-  session.lang = "en-US";
+  session.lang = globalThis.navigator?.languages?.find(lang => /^(es|en)(-|$)/i.test(lang)) || "en-US";
   const button = $("#llm-command");
   button.textContent = "Cancel LLM listening";
   refreshButtons();
@@ -320,11 +320,11 @@ $("#llm-command").addEventListener("click", () => {
     if (!transcript || locked()) return feedback("No demo submitted.");
     planning = true;
     refreshButtons();
-    feedback("Planning demo…");
+    feedback(`Heard “${transcript}”. Planning demo…`);
     try {
       const run = await request("/demos/voice", {method:"POST", body:{vehicleId, transcript}, timeout:45000});
       feedback(`Demo #${run.demoId} started with ${run.totalMovements} movements.`);
-    } catch (error) { feedback(error.message, true); }
+    } catch (error) { feedback(`Heard “${transcript}”. ${error.message}`, true); }
     finally { planning = false; refreshButtons(); }
   };
   session.onerror = event => {
