@@ -71,6 +71,25 @@ function watchStatus(generation) {
 let schema;
 let endpoints = [];
 const voiceWords = ["STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "RISE", "LOWER", "LIGHTS", "SOUND"];
+const spanishVoiceWords = ["ALTO", "ADELANTE", "ATRÁS", "IZQUIERDA", "DERECHA", "ARRIBA", "ABAJO", "LUCES", "SONIDO"];
+const languageSelect = $("#speech-language");
+try {
+  const saved = localStorage.getItem("indiscipline.speechLanguage");
+  if (["en-US", "es-MX"].includes(saved)) languageSelect.value = saved;
+} catch { /* Use the browser default if storage is unavailable. */ }
+languageSelect.addEventListener("change", () => {
+  try { localStorage.setItem("indiscipline.speechLanguage", languageSelect.value); } catch { /* Session only. */ }
+});
+
+function speechLanguage() {
+  return languageSelect.value || globalThis.navigator?.languages?.find(lang => /^(es|en)(-|$)/i.test(lang)) || globalThis.navigator?.language || "en-US";
+}
+
+function listeningButton(button, label, listening) {
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", String(listening));
+}
 let voiceSession = null;
 let llmSession = null;
 let planning = false;
@@ -129,7 +148,7 @@ function refreshButtons() {
     const code = Number(button.dataset.code);
     // STOP remains available after a polling failure so it can still be attempted.
     button.disabled = code === 0 ? stopQueued : (locked() || !commandFor(code));
-    button.title = code !== 0 && !commandFor(code) ? `No active command with code ${code}. Configure it in Menu → Commands.` : "";
+    button.title = code !== 0 && !commandFor(code) ? `No active command with code ${code}. Configure it in Menu → Commands.` : button.getAttribute("aria-label");
   });
 }
 
@@ -223,7 +242,7 @@ function finishVoice(session) {
   if (voiceSession !== session) return false;
   voiceSession = null;
   const button = $("#voice-command");
-  button.textContent = "Voice command";
+  listeningButton(button, "Voice command", false);
   button.classList.toggle("listening", false);
   return true;
 }
@@ -244,22 +263,23 @@ $("#voice-command").addEventListener("click", () => {
   if (!Recognition) return feedback("Voice recognition is unavailable in this browser.", true);
 
   const session = new Recognition();
-  session.lang = "en-US";
+  session.lang = speechLanguage();
+  const spanish = /^es(?:-|$)/i.test(session.lang);
   session.continuous = true;
   session.interimResults = false;
   voiceSession = session;
   const button = $("#voice-command");
-  button.textContent = "Stop listening and driving";
+  listeningButton(button, "Stop listening and driving", true);
   refreshButtons();
   button.classList.toggle("listening", true);
-  feedback("Say one word: forward, backward, left, right, rise, lower, lights, sound or stop. Movement continues until stopped or replaced.");
+  feedback(spanish ? "Di adelante, atrás, izquierda, derecha, arriba, abajo, luces, sonido o alto." : "Say one word: forward, backward, left, right, rise, lower, lights, sound or stop. Movement continues until stopped or replaced.");
 
   session.onresult = event => {
     for (let i = event.resultIndex; i < event.results.length && session === voiceSession; i++) {
       const result = event.results[i];
       if (!result.isFinal) continue;
       const word = result[0].transcript.trim().replace(/[.!?]+$/, "").trim().toUpperCase();
-      const code = voiceWords.indexOf(word);
+      const code = word === "STOP" ? 0 : spanish ? spanishVoiceWords.indexOf(word === "ATRAS" ? "ATRÁS" : word) : voiceWords.indexOf(word);
       if (code >= 0) sendCommand(code, session);
       else feedback("Unrecognized command. Still listening.");
     }
@@ -295,7 +315,7 @@ function cancelLlmListening() {
   const session = llmSession;
   llmSession = null;
   session.abort();
-  $("#llm-command").textContent = "LLM voice demo";
+  listeningButton($("#llm-command"), "LLM voice demo", false);
   refreshButtons();
 }
 
@@ -306,9 +326,9 @@ $("#llm-command").addEventListener("click", () => {
   if (!Recognition || !globalThis.isSecureContext) return feedback("LLM voice demos require HTTPS and browser speech recognition.", true);
   const session = new Recognition();
   llmSession = session;
-  session.lang = globalThis.navigator?.languages?.find(lang => /^(es|en)(-|$)/i.test(lang)) || "en-US";
+  session.lang = speechLanguage();
   const button = $("#llm-command");
-  button.textContent = "Cancel LLM listening";
+  listeningButton(button, "Cancel LLM listening", true);
   refreshButtons();
   feedback("Describe the sequence of movements.");
   session.onresult = async event => {
@@ -335,7 +355,7 @@ $("#llm-command").addEventListener("click", () => {
   session.onend = () => {
     if (llmSession !== session) return;
     llmSession = null;
-    button.textContent = "LLM voice demo";
+    listeningButton(button, "LLM voice demo", false);
     refreshButtons();
     feedback("No demo submitted.");
   };
